@@ -1,0 +1,621 @@
+---
+title: "Report on moment-based inference for WITS models"
+author: "Olivier Restif"
+date: "Created 28 November 2015"
+output: 
+  html_document: 
+    toc: true
+    fig_caption: yes
+    number_sections: yes
+    theme: readable
+---
+
+Last updated `r format(Sys.Date(),"%d %B %Y")`
+
+```{r init, echo=FALSE, message=FALSE}
+library(foreach)
+library(doParallel)
+registerDoParallel(cores=16)
+library(ggplot2)
+library(dplyr)
+library(tidyr)
+library(Rcpp)
+library(ellipse)
+library(powell)
+library(GGally)
+
+source("~/Documents/Work/server/Salmonella/ChrisWITS/Moments/WITS_moments.R")
+
+```
+
+# Moments of the probability distribution
+
+The first two moments (mean and variance) follow a closed system of 9 differential equations. See [Model Development](Notes_on_model_development_2.html).
+
+* Equation for the means in matrix form: $\dot{\textbf{M}_1} = \textbf{A} * \textbf{M}_1$, with
+
+$$\textbf{M}_1 = \begin{pmatrix} \textbf{E} N_B \\ \textbf{E} N_L \\ \textbf{E} N_S \end{pmatrix}, 
+\textbf{A} = \begin{pmatrix}
+	-(c_L+c_S) & e_L & e_S \\
+	cL & r_L-k_L-e_L & 0 \\
+	cS & 0 & r_S-k_S-e_S
+\end{pmatrix}$$
+
+which can be solved as $\textbf{M}_1(t) = \exp (t \mathbf{A}) * \textbf{M}_1(0)$. Although this does not have a closed analytical form (see [Mathematica notebook](Deterministic model.nb)), it can be solved numerically very easily.
+
+* Equation for the variances: Let $\textbf{M}_2 = {}^{T}\left[\textbf{V}(N_B), \textbf{V}(N_L), \textbf{V}(N_S), \textbf{V}(N_B,N_L), \textbf{V}(N_B,N_S), \textbf{V}(N_L,N_S) \right]$. Then:
+$\dot{\textbf{M}_2}(t) = \textbf{B} * \textbf{M}_1(t) + \textbf{C} * \textbf{M}_2(t)$
+
+$$\textbf{B} = \begin{pmatrix} 
+c_L+c_S & e_L & e_S \\
+c_L & r_L+k_L+e_L & 0 \\
+c_S & 0 & r_S+k_S+e_S \\
+-c_L & -e_L & 0 \\
+-c_S & 0 & -e_S \\
+0 & 0 & 0 
+\end{pmatrix}$$
+
+$$\textbf{C} = \begin{pmatrix} 
+-2c_L-2c_S & 0 & 0 & 2e_L & 2e_S & 0 \\
+0 & 2r_L-2k_L-2e_L & 0 & 2c_L & 0 & 0 \\
+0 & 0 & 2r_S-2k_S-2e_S & 0 & 2c_S & 0 \\
+c_L & e_L & 0 & -c_L-c_S-e_L+r_L-k_L & 0 & e_S \\
+c_S & 0 & e_S & 0 & -c_L-c_S-e_S+r_S-k_S & e_L \\
+0 & 0 & 0 & c_L & c_S & -e_L-e_S-k_L-k_S+r_L+r_S
+\end{pmatrix}$$
+
+We can solve the equation: $\dot{\textbf{M}_2}(t) - \textbf{C} * \textbf{M}_2(t) = \textbf{B} * \exp(t\ \textbf{A}) * \textbf{M}_1(0)$ using Duhamel's formula.
+
+The general solution is $\textbf{M}_2(t) = \exp(t\ \textbf{C}) * \textbf{M}_2(0) + \exp(t\textbf{C}) * \left[ \int_{0}^{t} \exp(-s \textbf{C}) * B * \exp(s \textbf{A}) ds \right] * \textbf{M}_1(0)$.
+
+**Note**: the presence of terms $r+k$ in matrix B suggest that this aproach may be sufficient to estimate all 8 parameters. However, it is important to remember that we expext to have a non-zero probability of extinction in the early hours, which could lead to bimodal distributions at later time points.
+
+
+# Computation of the moments in R
+
+## Methods
+
+In general, each step of the inference will require the computation of $\textbf{M}_2(t)$ at a small number of time points, so the critical steps will be the computaion of the integral and, within it, exp(-s C) and exp(s A) across many values of s.
+
+* _Matrix exponentials_ can be computed using the `expm` package, which implements several algorithms, including: "Higham08.b", "AlMohy-Hi09", "Ward77",  "Pade" and "Taylor".
+* _Integral_: I tried two numerical integration methods with fixed intervals of size $h$, either a **linear** or a **cubic** approximation.
+* _Intervals_: earlier tests have shown that the computation of the integral over large intervals of time can produce huge errors in the estimation of the variances. A simple solution is to break down the time period into smaller intervals, using the values at the end of an interval as the starting point for the next interval. 
+
+I ran several tests:
+
+* Benchmark of the different combinations of numerical algorithms and approximations for the computation of the integral.
+* Tests using the 3-stage scenario for Salmonella in blood, liver and spleen (bottleneck-expansion-spillover) suggest that moments capture the key patterns produced by Gillespie simulations.
+
+
+## Benchmark analysis
+
+The results below were obtained by running the file `WITS_moments_benchmark.R` on a 16-core MacPro on 5 March 2016.
+
+```{r, echo=FALSE}
+load("~/Documents/Work/server/Salmonella/ChrisWITS/Moments/expm_benchmark.RData")
+```
+
+As a standard, I calculated the 9 moments of the distribution from 10,000 Gillespie simulations of the Blood-Liver-Spleen model with an arbitrary set of parameters (all >0) and a Poisson-distributed inoculum (average size 100). The simulations were run for 72h, and the moments computed at 24, 48 and 72h.
+
+Paramaters: `r paste(names(par.test),par.test,sep="=")`
+
+I then computed the predicted moments using the same parameters, and initial conditions $E(N_B)=V(N_B)=100$ to mimick a Poisson. I computed `r nrow(expm.moments.benchmark)` sets of moments, one for each combinatin of the following controls:
+
+* Five methods for the matrix exponential from `expm`: "Higham08.b", "AlMohy-Hi09", "Ward77",  "Pade" and "Taylor"
+* Four methods to calculate the integral:
+	1. Integrate the matrix `exp(-sC)*B*exp(sA)` using linear approximation
+	2. Integrate the matrix `exp(-sC)*B*exp(sA)`  using Simpson's cubic approximation 
+	3. Integrate the vector `exp(-sC)*B*exp(sA)*M1` using linear approximation 
+	4. Integrate the vector `exp(-sC)*B*exp(sA)*M1` using Simpson's cubic approximation 
+* Three durations: 24, 48 or 72h
+* Three intervals: 1h, 6h or 12h
+* Three integration steps $h$: 0.005, 0.05 and 0.5h.
+
+The plots below show the elapsed computing time (on my Mac Pro), the maximum modulus of the 9 relative errors (compared to the simulated moments) for each method.
+
+
+```{r expm_benchmark_1, echo=FALSE, fig.height=6, fig.width=9}
+# Time elapsed
+expm.moments.benchmark %>% ggplot(aes(integration,elapsed)) + geom_point(aes(col=as.factor(h), shape=met),size=2) + facet_grid(t~dt) + scale_y_log10(breaks=as.numeric(c(1,2,5) %o% 10^(-2:1)))
+
+# Relative error
+expm.moments.benchmark %>% ggplot(aes(integration,log10(max.err))) + geom_point(aes(col=as.factor(h), shape=met),size=2) + facet_grid(t~dt)
+
+```
+
+
+These indicate that "AlMohy-Hi09" is generally the fastest algorithm with no effect on errors. In order to refine the choice of the other controls (integration method, integration step $h$, and interval), the graph below show the same benchmarks (time elapsed vs. maximum error) for "AlMohy-09" only, omitting the 12h interval:
+
+```{r expm_benchmark_2, echo=FALSE, fig.height=6, fig.width=8}
+
+# Error vs. Time
+expm.moments.benchmark %>% filter(met=="AlMohy-Hi09" & dt<10) %>% ggplot(aes(max.err,elapsed)) + geom_point(aes(col=as.factor(h), shape=integration),size=3) + facet_grid(t~dt) + scale_y_log10(breaks=as.numeric(c(1,2,5) %o% 10^(-2:1))) + scale_shape_manual(values=c(0,2,15,17))
+
+```
+
+**Conclusion:** the following combination (open blue triangle in the bottom-right panel) appears to offer the best balance between high speed (<0.1s) and low error (< 1%) in the 72h model:
+
+* expm method: "AlMohy-09"" (fastest)
+* interval: 6h (optimum)
+* integration step: 0.5h (or even larger)
+* integration method: linear/matrix; in the majority of cases (but not always), the linear approximation offered better accuracy than the cubic approximation, while integration of the matrix was marginally faster than the vector. 
+
+For comparison, running 1,000 Gillespie simulations of the same model (for 72h), parallelised across 16 cores, took 8s (total user time 180s).
+
+Note: the integration could be parallelised if needed (e.g. if it was necessary to decrease $h$ substantially).
+
+
+# Choice of divergence measure for inference
+
+## Definitions
+
+Consider a distance or metric $d : \mathbb{R}^9 \times \mathbb{R}^9 \rightarrow \mathbb{R}$ between pairs of vectors of moments $\mathcal{M} = \{E(N_B), E(N_L), E(N_S), V(N_B),V(N_L), V(N_S), V(N_B,N_L), V(N_B,N_S), V(N_L,N_S) \}$. Given a dynamic model with a set of parameters $\theta \in \mathbb{R}^k$, we can then calculate a metric between the _predicted_ moments $\mathcal{M}_p(\theta,t)$ computed from the above equation, and an _observed_ sample of any size $X = \{N_B,N_L,N_S\} \in (\mathbb{R}^{n})^3$ with empirical moments $\mathcal{M}_d(X)$, as: $\delta(X,\theta) = d(\mathcal{M}_d(X),\mathcal{M}_p(\theta))$.
+
+## Objective
+
+We want to choose a function $\delta$ that enables us to infer (a posterior distribution of) the parameter set $\theta_d$ which generated an observed dataset $X$.
+In particular, $\delta(X(\theta_d),\theta)$ should be minimised when $\theta = \theta_d$.
+
+## Candidates
+
+* The __Mahalanobis__ distance of a _single_ point $X_i=\{N_B[i],N_L[i],N_S[i]\}$ from a distribution (or a sample) with mean $\mu \in \mathbb{R}^3$ and covariance matrix $\Sigma$ is defined as $$\mathcal{D}_M(X_i,\mathcal{M})= \sqrt{(X_i-\mu)^t\ \Sigma^{-1} (X_i-\mu)}$$ 
+	* The R function `mahalanobis(x,center,cov)` returns the _squared_ distance. 
+	* If $X \sim \mathcal{N}(\mathcal{M})$, then $\mathcal{D}_M^2(X,\mathcal{M}) \sim \chi^2_3$. _Does this apply to non-normal variables?_
+	* Compute the Kolmogorov-Smirnov statistic for the difference between the sample of Mahalonobis distances and a Chi-squared distribution.
+* The __Bhattacharyya__ distance between two multivariate (_normal_) distributions with moments $(\mu_1,\Sigma_1)$ and $(\mu_2,\Sigma_2)$ is equal to: $$\mathcal{D}_B(\mathcal{M}_1,\mathcal{M}_2) = \frac{1}{8} (\mu_1-\mu_2)^t\ \Sigma^{-1}\ (\mu_1-\mu_2) + \frac{1}{2} \log(\frac{|\Sigma|}{\sqrt{|\Sigma_1| |\Sigma_2|}})$$ where $\Sigma = \frac{\Sigma_1+\Sigma_2}{2}$. More commonly used, the **Hellinger** distance is equal to $\mathcal{D}_H = (1-e^{-\mathcal{D}_B})^{1/2}$.
+* The __Kullback-Leibler__ divergence (_not_ symmetric) from multivariate (_normal_) distribution  $\mathcal{MN}(\mu_0,\Sigma_0)$ to $\mathcal{MN}(\mu_1,\Sigma_1)$ in dimension $k$, is equal to: $$\mathcal{D}_{KL}(\mathcal{M}_0,\mathcal{M}_1) = \frac{1}{2} \left[\mathrm{tr}(\Sigma_1^{-1}\Sigma_0) + (\mu_1-\mu_0)^t\ \Sigma_1^{-1}\ (\mu_1-\mu_0) - k + \log \frac{|\Sigma_1|}{|\Sigma_0|}\right]$$
+* "Distance-learning" or "metric-learning" algorithms have been developed to compare datasets and identify their original distributions.
+
+
+## KL divergence {.tabset}
+
+Notes:
+
+* The equation above is the KL divergence for two multivariate _normal_ distributions, it is __not__ the KL divergence from the predicted distribution of bacteria to the observed. Instead I'm using the formula as an _arbitrary_ moment-based metric, and I will now test that it is fit for purpose.
+* The tests below are based on the KL divergence _from predicted to observed_. However, according to statistical theory, it would make more sense to base inference on the divergence _from observed (reality) to predicted (model)_. I have run the same tests with the opposite KL divergence (see [file](WITS_Moments_KL_2.html)), with variable results: inference is a bit better for the IBD model, but breaks down in the last phase of the BES model.
+
+
+**To do:**
+
+* It would be worth comparing the selected metric to the actual KL-divergence between the observed and predicted distributions of bacteria, estimated from samples (which is not a trivial problem).
+
+The R code for the tests is in "Moments/WITS_moments_tests_KL.R".
+
+### Test 1: Immigration-Birth-Death (IBD) process
+
+``` {r, echo=FALSE}
+load("~/Documents/Work/server/Salmonella/ChrisWITS/Moments/KL_tests_1.RData")
+```
+
+**Stochastic noise.** From a given parameter set ($c_L$ = `r ibd.par.ref["cL"]`, $r_L$ = `r ibd.par.ref["rL"]`, $k_L$ = `r ibd.par.ref["kL"]`) and initial conditions (Poisson-distributed inoculum), I generated 10,000 Gillespie simulations, and calculated the "observed moments", either from all of them or from random subsets. I compared them to the "predicted moments" computed directly from the parameter values. The figures below show the distribution of KL divergences from the predicted moments to random subsets of simulations, varying either the number of simulations from which the observed moments were computed at t=12h  (left panel), or the observation time (right panel). Each boxplot represents 1000 subsets of simulations compared to a single predicted distribution, all generated using the same parameters.
+
+```{r, echo=F, fig.width=10, fig.height=5}
+par(mfrow=c(1,2),cex.main=1)
+
+boxplot(ibd.KL.sim.dist,log="y",xlab="Number of simulations (WITS)",ylab="KL divergence",main="Distribution of KL to subsets of simulations")
+
+boxplot(ibd.KL.sim.t.obs,log="y",xlab="Observation time",ylab="KL divergence to sample of 80 simulations", main="Distribution of KL for different observation times")
+
+```
+
+**Parameter sensitivity.** For the purpose of parameter inference, it is important to copare the sensitivity of the KL divergence to the parameters of the model. Here, I calculated the KL divergence from a range of predicted moments (obtained by varying each parameter in turn) to subsets of simulations obtained from the original set of parameter values. As before, each boxplot illustrates the stochastic variation in KL across subsets of 80 simulations. In the fourth plot (bottom-right), I varied $k_L$ and $r_L$ simultaneously, keeping the difference $r_L-k_L$ constant. The vertical red lines show the parameter values that were used to generate the simulations.
+
+```{r, echo=F, fig.width=12, fig.height=5}
+par(mfrow=c(1,4),cex.lab=1.5,mar=c(4,4,1,1), oma=c(2,0,0,0))
+boxplot(ibd.KL.sim.cL,log="y",xlab="Value of cL for prediction",ylab="KL divergence to sample of 80 simulations")
+abline(v=ibd.par.ref["cL"]*10,col="red",lwd=2,lty=2)
+
+boxplot(ibd.KL.sim.kL,log="y",xlab="Value of kL for prediction",ylab="KL divergence to sample of 80 simulations")
+abline(v=ibd.par.ref["kL"]*10,col="red",lwd=2,lty=2)
+
+boxplot(ibd.KL.sim.rL,log="y",xlab="Value of rL for prediction",ylab="KL divergence to sample of 80 simulations")
+abline(v=ibd.par.ref["rL"]*10,col="red",lwd=2,lty=2)
+
+boxplot(ibd.KL.sim.kL.2,log="y",xlab="Value of kL for prediction",ylab="KL divergence to sample of 80 simulations")
+abline(v=ibd.par.ref["kL"]*10-2,col="red",lwd=2,lty=2)
+
+```
+
+**Parameter inference**: using a single set of simulations to calculate the observed moments, I used the `powell()` optimisation routine to estimate the set of parameter values that generated the predicted moments with lowest divergence. With the same set of parameters as above, and assuming the inoculum distribution is known, the optimisation routine on 3 parameters is extremely fast and quite accurate. To get a sense of the parameter uncertainty associated with stochastic data, I repeated the optimisation on 1000 subsets of 80 simulations based on the same parameter values. As shown on the right panel, estimates of $k_L$ and $r_L$ were highly correlated, with a very accurate estimation of the net growth rate. The blue ellipse is the 95% bivariate confidence area based on the variance-covariance matrix of the paired estimates. The red crosses show the target parameter values.
+
+```{r, echo=F, fig.width=8, fig.height=4}
+par(mfrow=c(1,2),cex.lab=1.5,mar=c(4,4,1,1))
+
+boxplot(ibd.KL.optim.bs)
+points(1:3, ibd.par.ref[c("cL","kL","rL")], col="red", pch="+", cex=3)
+
+plot(ibd.KL.optim.bs[,'kL'],ibd.KL.optim.bs[,'rL'],pch=".", xlab="kL", ylab="rL")
+lines(ellipse(cor(ibd.KL.optim.bs[,"kL"],ibd.KL.optim.bs[,"rL"]),centre=c(mean(ibd.KL.optim.bs[,"kL"]),mean(ibd.KL.optim.bs[,"rL"])),scale=c(sd(ibd.KL.optim.bs[,"kL"]),sd(ibd.KL.optim.bs[,"rL"]))),col="blue",lwd=2)
+points(ibd.par.ref["kL"],ibd.par.ref["rL"], col="red", pch="+", cex=3)
+```
+
+I repeated the optimisation across 27 sets of parameter values, assuming the same Poisson-distributed inoculum and a single observation, either at t=2h or t=12h, with a total of 80 WITS. Each boxplot shows the distribution of parameter estimates across 128 subsets of 80 simulations:
+
+```{r, echo=F,fig.width=12,fig.height=6}
+par(mfrow=c(3,9),mar=c(2,2,1,0.5),oma=c(1,0,4,0))
+for(i in 1:nrow(ibd.par.grid.KL)){
+	boxplot(ibd.KL.estimates.grid.1[[i]],ylim=c(0,1))
+	points(1:3,ibd.par.grid.KL[i,],col="red",pch="+",cex=3)
+}
+title(main="Inference from observations at t=2h",outer=T)
+for(i in 1:nrow(ibd.par.grid.KL)){
+	boxplot(ibd.KL.estimates.grid.2[[i]],ylim=c(0,1))
+	points(1:3,ibd.par.grid.KL[i,],col="red",pch="+",cex=3)
+}
+title(main="Inference from observations at t=12h",outer=T)
+```
+
+### Test 2: Bottleneck-Expansion-Spillover (BES) model
+
+This is the full 3-compartment model with 8 parameters. There are three stages, inline with Grant et al (2008) and Coward et al (2015):
+
+- **Bottleneck**: At t=0, an inoculum is introduced in the blood and allowed to migrate into the liver and spleen at rates $c_L$ and $c_S$ respectively, where the bacteria can replicate (rates $r_L$ and $r_S$) and die (rates $k_L$ and $k_S$). Initially (first 6 h), the net growth rates $r_L-k_L$ and $r_S-k_S$ are negative (hence the bottleneck).
+- **Expansion**: From t=6h, the replication and killing rates change in both organs, producing positive net growth rates.
+- **Spillover**: From t=24h, the emigration rates from the liver ($e_L$) and from the spleen ($e_S$) into the blood become positive, allowing mixing between the three compartments.
+
+```{r, echo=F,comment=NULL}
+load("~/Documents/Work/server/Salmonella/ChrisWITS/Moments/KL_tests_BES.RData")
+
+rbind(Bottleneck=bes.par.B,Expansion=bes.par.E,Spillover=bes.par.S)
+
+```
+
+In line with the original experimental design with WITS, we assume that the inoculum doses are even mixtures of multiple identical WITS, and we model each WITS independently, irrespective of whether they are in the same mouse or not. For the purpose of parameter inference, we produce a large dataset by running 1000 Gillespie simulations and store the number of bacteria in the blood, liver and spleen at each observtion time: 0.5h, 6h, 24h and 48h post-inoculation. The inoculum is drawn from a Poisson distribution with mean `r bes.M0[1]`.
+
+``` {r BES.simulations, echo=FALSE,fig.width=12,fig.height=4.8,comment=NULL,fig.caption="Simulations"}
+par(mfrow=c(1,3))
+
+plot(bes.sim.B[,5],bes.sim.B[,6],xlim=c(0,30),ylim=c(0,30),col="blue",main="Bottleneck - 6h",xlab="Liver",ylab="Spleen")
+lines(ell.bes.sim.B,col="blue",lwd=2)
+points(bes.sim.0[,5],bes.sim.0[,6], pch=3,col="black")
+lines(ell.bes.sim.0,col="black",lwd=2,lty=2)
+legend("topright",c("0.5h","6h"),pch=c(3,1),col=c("black","blue"))
+
+plot(bes.sim.E[,5],bes.sim.E[,6],xlim=c(0,1500),ylim=c(0,1500),col="red",main="Expansion - 24h",xlab="Liver",ylab="Spleen")
+lines(ell.bes.sim.E,col="red",lwd=2)
+
+plot(bes.sim.S[,5],bes.sim.S[,6],xlim=c(0,1E5),ylim=c(0,1E5),col="green2",main="Spillover - 48h",xlab="Liver",ylab="Spleen")
+lines(ell.bes.sim.S,col="green2",lwd=2)
+```
+
+Note: the low inoculum size produces a large probability of extinction in the Bottleneck phase, which is presumably not optimal for the moments method. 
+
+Moments computed from the simulations and by integration:
+
+```{r, echo=F, comment=NULL}
+# Compare with simulated moments
+round(cbind(sim.05=bes.sim.mom.0,int.05=bes.mom.0,sim.6=bes.sim.mom.B,int.6=bes.mom.B,sim.24=bes.sim.mom.E,int.24=bes.mom.E,sim.48=bes.sim.mom.S,int.48=bes.mom.S),1)
+
+```
+
+
+
+#### Parameter inference in the Bottleneck phase
+
+We use the first two observation points (0.5 and 6h). Because the data have no bacteria in the blood at t=6h, we can only a KL divergence using the Liver-Spleen pair. At t=0.5h, we can choose to use all three organs, or only Liver and Spleen.
+
+
+- Known inoculum, no emigration, using 3 organs at t=0.5h. Compare the estimates based on the sum, product or max of the two KL divergences:
+
+```{r, echo=F, comment=NULL}
+round(cbind(
+	target = c(bes.par.B[names(bes.KL.optim.ckr.B$par)]),
+	KL.sum = c(bes.KL.optim.ckr.B$par),
+	KL.prod = c(bes.KL.optim.ckr.B.2$par),
+	KL.max = c(bes.KL.optim.ckr.B.3$par)
+	),3)
+```
+
+- Known inoculum, no emigration, using 2 organs at t=0.5h:
+
+```{r, echo=F, comment=NULL}
+round(cbind(
+	target = c(bes.par.B[names(bes.KL.optim.ckr.B$par)]),
+	KL.sum = c(bes.KL.optim.b.ckr.LS.sum$par),
+	KL.prod = c(bes.KL.optim.ckr.B.2$par),
+	KL.max = c(bes.KL.optim.b.ckr.LS.max$par)
+	),3)
+```
+
+- Known inoculum, estimate all 8 parameters, using 3 organs at 0.5h, and minising the sum of the two KL divergences:
+
+```{r, echo=F, comment=NULL}
+round(cbind(
+	target = c(bes.par.B),
+	KL.sum = c(bes.KL.optim.b.cekr.BLS.sum$par)
+	),4)
+```
+
+
+#### Inter-sample variability
+
+The following plots show the distributions of parameter estimates obtained in each phase from 36 datasets of 100 WITS each. In other words, each boxplot represents 36 estimates, each obtained by minimising the KL-divergence for the moments calculated from 100 simulations. Additional parameters gL=rL-kL and gS=rS-kS show the net growth rate. The red crosses show the true parameter values.
+
+- Bottleneck: known inoculum, no emigration, minimise the sum of the two KL divergences. 64 datasets of 100 simulations.
+- Expansion: initial moments at t=6h from the data, liver-spleen only, no emigration. 64 datasets of 100 simulations.
+- Spillover: initial moments at t=24h from the data, all organs. 32 datasets of 100 simulations.
+
+```{r, echo=F, fig.width=12, fig.height=5}
+par(mfrow=c(1,3))
+# Bottleneck
+bes.B.bs.ext <- cbind(bes.KL.optim.B.bs[,1:6],gL=bes.KL.optim.B.bs[,3]-bes.KL.optim.B.bs[,5],gS=bes.KL.optim.B.bs[,4]-bes.KL.optim.B.bs[,6],D=bes.KL.optim.B.bs[,7])
+boxplot(bes.B.bs.ext,ylim=c(0,1.5), main="Bottleneck parameters",yaxs="i")
+points(1:6,bes.par.B[names(bes.KL.optim.ckr.B$par)],pch="+",col="red",cex=2)
+points(7:8,c(bes.par.B["kL"]-bes.par.B["rL"],bes.par.B["kS"]-bes.par.B["rS"]),pch="+",col="red",cex=2)
+# Expansion
+bes.E.bs.ext <- cbind(bes.KL.optim.E.bs[,1:4],gL=bes.KL.optim.E.bs[,3]-bes.KL.optim.E.bs[,1],gS=bes.KL.optim.E.bs[,4]-bes.KL.optim.E.bs[,2],D=bes.KL.optim.E.bs[,5])
+boxplot(bes.E.bs.ext,ylim=c(0,1.5), main="Expansion parameters",yaxs="i")
+points(1:4,bes.par.E[names(bes.par.kr)],pch="+",col="red",cex=2)
+points(5:6,c(bes.par.E["rL"]-bes.par.E["kL"],bes.par.E["rS"]-bes.par.E["kS"]),pch="+",col="red",cex=2)
+# Spillover
+bes.S.bs.ext <- cbind(bes.KL.optim.S.bs[,1:8],gL=bes.KL.optim.S.bs[,7]-bes.KL.optim.S.bs[,5],gS=bes.KL.optim.S.bs[,8]-bes.KL.optim.S.bs[,6],D=bes.KL.optim.S.bs[,9])
+boxplot(bes.S.bs.ext, ylim=c(0,1.5), main="Spillover parameters",yaxs="i")
+points(1:8,bes.par.S[names(bes.par.def)],pch="+",col="red",cex=2)
+points(9:10,c(bes.par.S["rL"]-bes.par.S["kL"],bes.par.S["rS"]-bes.par.S["kS"]),pch="+",col="red",cex=2)
+
+```
+
+
+### Reverse KL divergence (from data to model)
+
+**To do: Re-run with corrected Gillespie code**
+
+Similar results.
+
+### Estimation of the actual KL divergence between bacterial distributions
+
+**Not done.**
+
+The goal is to estimate the KL divergence between two multivariate distributions based on samples. The distributions are positive, and can be either discrete (for the true numbers of bacteria) or continuous (when including experimental noise). Given that the discrete distributions considered typically have a very large support compared to sample size, they present the same problem as continuous ditributions for estimating the probability distribution. 
+
+One approach is to bin the reference sample to turn the problem into a discrete distribution. An alternative estimator is based on nearest-neighbour distances ($k$-NN).
+
+
+
+## Hellinger distance
+
+I ran the same tests using the Hellinger distance between multivariate normal distributions as a metric. The results are shown in this [file](WITS_Moments_Hell_2.html)
+
+Overall, they are not as good as those obtained with the KL distance above.
+
+
+## Mahalanobis distance
+
+**To do: Re-run with corrected Gillespie code**
+
+Given a sample of Mahalanobis distances from individual data points to a predicted distribution, I calculated a goodness-of-fit statistic, assuming that the sample is drawn from a $\chi^2_k$ distribution, where $k$ is the dimension of the observed variable (i.e. number of organs): Euclidian distance from the mean of the sample of Mahalanobis distances to $k$ (i.e. the mean of the $\chi^2_k$ distribution). Parameter inference is then performed by minimising the distance from the mean Mahalanobis distance to $k$.
+
+## Further considerations
+
+One of the issues encountered in the tests is the convergence of the optimisation algorithm. The `powell()` function generally fares better than `optim()` with multiple parameters, but it sometimes struggles, especially with the full model. 
+
+**TO DO:** Given the known correlation between $k$ and $r$ in this model, it would be worth trying the optimisation on a re-parameterised model using $\alpha_L=r_L-k_L$, $\beta_L=r_L+k_L$, $\alpha_S=r_S-k_S$, $\beta_S=r_S+k_S$.
+
+A series of tests suggests the results are not improved by this reparameterisation (see `WITS_rep_moments_tests_KL.R`).
+
+
+
+# Considerations for analysis of experimental data
+
+Exisiting datasets of _Salmonella_ WITS in mice may introduce additional issues:
+
+* Data from the blood may be missing
+* When present, they represent only a sample
+* The observation process introduces noise
+* The absence of bacteria from one organ will lead to null variance and covariance, hence a singular covariance matrix preventing the calculation of the KL divergence.
+
+
+## Experimental noise
+
+If the noise can be modelled with a probability distribution, a simple option would be to generate multiple transformed datasets by sampling the original dataset with the corresponding probability distribution. Parameter estimates can then be obtained from each transformed dataset. 
+
+A more involved approach would be to determine mathematically how this noise would affect the moments of the predited distributions. Intuitively, this would increase the variances and decrease the absolute values of the covariances.
+
+
+## Zeroes
+
+Predicted null moments should not appear in the model, unless bacteria are missing from an organ from the start with no immigration. Emigration and death can result in the moments tending to zero exponentially, but should never reach zero. 
+
+A crude solution would be to replace any 0 in the observed moments with a very small $\epsilon$. This should not affect the accuracy of the parameter estimation.
+
+Re-sampling of the data to account for experimental noise should have the potential to generate non-zero terms. However, if the KL-distance is calculated only for those with non-zero varaicens, it may introduce a bias in the estimation. A possible solution then would be to calculate the KL-divergence to the average of the re-sampled moments.
+
+
+## Missing data
+
+If an organ is absent from a dataset, we need to estimate the model parameters using only a subset of moments. The tests above show that it's feasible to use liver and spleen only. Any parameter absent from this subset would have to be ignored.
+
+If a data point within a dataset misses one organ, it can still be used to calculate the moments.
+
+
+
+
+# Parameter estimation from Chris Coward's datasets
+
+On 26 February 2016, I started estimating model parameters from Chris Coward's dataset (from the Coward et al 2015 paper).
+
+```{r, echo=F, message=FALSE}
+load("~/Documents/Work/server/Salmonella/ChrisWITS/Moments/WITS_moments_data_fit.RData")
+library(GGally)
+```
+
+## Technical issues and comments
+
+### Initial conditions
+
+The file `Compiled_inoculum.csv` contains the WITS composition and CFU counts from 3 inoculum doses from each experiment. This provides a way to estimate both the mean and variance of the initial number of WITS copies. Note that, unfortunately, qPCR data from plated doses are only available for experiment M004 (live vaccine):
+
+```{r, echo=F, comment=NULL}
+inoc.data %>% filter(Experiment=="M004") %>% select(Wits,starts_with("Plate"))
+```
+
+From those 24 values, we can estimate the mean: `r round(mean(init.M004.omega),2)`, and variance: `r round(var(init.M004.omega),2)` of WITS abundances in inoculum doses. Note that the variance is almost twice that expected for a Poisson distribution, and this appears to be caused by both inter-sample and inter-WITS variability.
+
+### Sources of uncertainty
+
+* Demographic stochasticity: captured by the variance-covariance of the distribution of bacteria
+* Inoculum size variation: captured by the variance in the initial distribution
+* Sampling stochasticity: dealt with by bootstrapping
+* Experimental noise: estimated from in vitro data, can be incorporated into the bootstrap by adding a random term to each data point
+* Mouse effect: currently ignored; would require a hierarchical (or mixed-effect) statistical model
+
+### Goodness of fit
+
+Once a minimum distance has been found, a probabilistic goodness-of-fit measure can be obtained by simulating a large number of datasets from the fitted model, and calculate the divergence between the predicted moments and each simulated distribution; hence the distance to the original dataset can be ranked and a p-value can be estimated.
+
+
+## Results
+
+### Bottleneck phase (first 6 hours)
+
+#### Live vaccine in wild-type mice (M004 experiment)
+
+**(i) Control group (naive).** 
+
+- **Model with known inoculum size:** obtained by minimising the sum or the max of the KL indices at 0.5h and 6h, with an initial variance at t=0 either equal to the mean (Poisson) or as estimated from the data (empirical):
+
+```{r, echo=F, comment=NULL}
+print(cbind(
+	sum.Poi = c(M004.wt.naive.6.KL.optim.ckr.BLS.sum$par,div=M004.wt.naive.6.KL.optim.ckr.BLS.sum$value),
+	sum.emp = c(M004.wt.naive.6.KL.optim.ckr.BLS.sum.b$par,div=M004.wt.naive.6.KL.optim.ckr.BLS.sum.b$value),
+	max.Poi = c(M004.wt.naive.6.KL.optim.ckr.BLS.max$par,div=M004.wt.naive.6.KL.optim.ckr.BLS.max$value*2),
+	max.emp = c(M004.wt.naive.6.KL.optim.ckr.BLS.max.2$par,div=M004.wt.naive.6.KL.optim.ckr.BLS.max.2$value*2)),
+	digits = 3
+)
+
+```
+
+Note: although the parameter values are fairly consistent (except for kL and rL with Poisson inoculum and max), the divergence values are much higher than what was achieved with simulated data. This suggests a substantial lack of goodness-of-fit. This had been addressed in the original ML analysis by adding an additional parameter for the effective inoculum size, i.e. assuming that an unknown proportion of bacteria from the inoculum fail to establish in either organ.
+
+
+
+_Bootstrapped estimates:_ I repeated the minimisation of the sum of the KL-divergences 64 times, assuming a Poisson-distributed inoculum, each time re-sampling the data at 0.5h and 6h. The blue dots are the estimates from the raw data, and the red crosses are the MLE from Coward et al.
+
+```{r, echo=FALSE, fig.height=5, message=FALSE}
+par(mar=c(3,3,1,0), las=1)
+boxplot(M004.wt.naive.6.KL.optim.bs.ckr.BLS.sum,log="y")
+
+# Overlay the direct estimates
+points(c(M004.wt.naive.6.KL.optim.ckr.BLS.sum$par,M004.wt.naive.6.KL.optim.ckr.BLS.sum$value), col="blue",pch=16,cex=2)
+
+# Overlay the MLE from Coward et al 
+attach("~/Documents/Work/server/Salmonella/ChrisWITS/Results_3k/WITS_MLE_3k_M004_wt_naive_powell_series.RData")
+points(mle.3k.M004.wt.naive.05.6.powell.series$par,col="red",pch=3,cex=2,lwd=2)
+detach()
+
+```
+
+
+```{r, echo=FALSE, fig.height=6, fig.width=6}
+# Pairwise plot of parameter values 
+ggpairs(M004.wt.naive.6.KL.optim.bs.ckr.BLS.sum,columns=1:6)
+```
+
+
+- **Model with unknown inoculum size:** in line with analysis in Coward et al, I added an unknown parameter $x_i$ giving the effective inoculum size per WITS (expected to be less than 30).
+
+Note: because of the different orders of magnitude, the most efficient method is to estimate the log of all 6 parameters.
+
+```{r, echo=F, comment=NULL}
+round(c(10^M004.wt.naive.6.KL.optim.ickr.BLS.sum.2$par,D.sum=M004.wt.naive.6.KL.optim.ickr.BLS.sum.2$value),3)
+```
+
+Bootstrapped estimates. I repeated the minimisation of the sum of the KL-divergences 64 times, assuming a Poisson-distributed inoculum, each time re-sampling the data at 0.5h and 6h. The blue dots are the estimates from the raw data, the red crosses are the MLE from Coward et al, and the '>' on the left shows the average inoculum size.
+
+```{r, echo=FALSE, fig.height=5, warning=FALSE, message=FALSE}
+par(mar=c(3,4,1,0), las=1)
+boxplot(M004.wt.naive.6.KL.optim.bs.ickr.BLS.sum[,1:8],log="y")
+# Overlay the direct estimates
+points(c(10^M004.wt.naive.6.KL.optim.ickr.BLS.sum.2$par,M004.wt.naive.6.KL.optim.ickr.BLS.sum.2$value), col="blue",pch=16,cex=2)
+
+# Overlay the MLE from Coward et al 
+attach("~/Documents/Work/server/Salmonella/ChrisWITS/Results_3k/WITS_MLE_3k_M004_wt_naive_powell_inoc_series.RData")
+points(mle.3k.M004.wt.naive.05.6.powell.inoc.series$par,col="red",pch=3, cex=2,lwd=2)
+detach()
+
+# True inoculum size
+points(0.3,mean(init.M004.cfu)/8,pch=">",cex=2)
+
+```
+
+
+```{r, echo=FALSE, fig.height=6, fig.width=6, warning=FALSE}
+ggpairs(M004.wt.naive.6.KL.optim.bs.ickr.BLS.sum,columns=1:7)
+```
+
+Surprisingly, the estimated inoculum size is barely different from the real one, and the divergence is hardly reduced.
+
+- **Model with unknown inoculum size and two-way migration (icekr).** Distribution from 28 bootstraps. Median of estimates:
+
+```{r, echo=FALSE} 
+round(apply(M004.wt.naive.6.KL.optim.bs.icekr.BLS.sum[,1:10],2,median,na.rm=T),3)
+```
+
+```{r, echo=FALSE, fig.height=5, warning=FALSE}
+par(mar=c(3,4,1,0), las=1)
+boxplot(M004.wt.naive.6.KL.optim.bs.icekr.BLS.sum[,1:10],log="y")
+```
+
+
+**TO DO:** calculate p-value from simulated data at the minimum divergence estimate, and investigate alternative assumptions that may improve the goodness of fit.
+
+- **Goodness of fit**: Comparison of moments of the data and the three fitted models:
+
+```{r, echo=FALSE, comment=NULL}
+
+# Basic model (ckr)
+par.1 <- replace.par(bes.par.B,M004.wt.naive.6.KL.optim.ckr.BLS.sum.b$par)
+mom.1.05 <- WITS.moment.sol.steps(0.5,par.1,init.mom.M004.b,h=0.01)
+mom.1.6 <- WITS.moment.sol.steps(6,par.1,init.mom.M004.b,h=0.05)
+
+# Extended model (ickr)
+par.2 <- replace.par(bes.par.B,10^M004.wt.naive.6.KL.optim.ickr.BLS.sum.2$par[-1])
+inoc.2 <- 10^M004.wt.naive.6.KL.optim.ickr.BLS.sum.2$par[1]
+init.mom.2 <- c(inoc.2,0,0, inoc.2,0,0, 0,0,0)
+mom.2.05 <- WITS.moment.sol.steps(0.5,par.2,init.mom.2,h=0.01)
+mom.2.6 <- WITS.moment.sol.steps(6,par.2,init.mom.2,h=0.05)
+
+# Complete model (icekr)
+par.3 <- 10^M004.wt.naive.6.KL.optim.icekr.BLS.sum.2$par[-1]
+inoc.3 <- 10^M004.wt.naive.6.KL.optim.icekr.BLS.sum.2$par[1]
+init.mom.3 <- c(inoc.3,0,0, inoc.3,0,0, 0,0,0)
+mom.3.05 <- WITS.moment.sol.steps(0.5,par.3,init.mom.3,h=0.01)
+mom.3.6 <- WITS.moment.sol.steps(6,par.3,init.mom.3,h=0.05)
+
+
+round(cbind(data.05=mom.M004.wt.naive.05, ckr.05=mom.1.05, ickr.05=mom.2.05, icekr.05=mom.3.05),3)
+round(cbind(data.6=mom.M004.wt.naive.6, ckr.6=mom.1.6, ickr.6=mom.2.6, icekr.6=mom.3.6),3)
+```
+
+- **Next steps**: Possible approaches to improve the fit include:
+	+ Allow for temporal variations in some of the parameters
+	+ Allow for variability among mice
+	+ Allow for heterogeneity in bacterial populations
+
+- - - - - - -
+
+**(ii) Vaccinated group**. 
+
+Although blood samples were taken, no bacteria were recovered from the blood at either time point. Because the corresponding variance-covariance terms are exactly 0, we cannot compute KL-divergence to the raw data from the complete model. Ignoring Blood data would be inaccurate. 
+An ad hoc solution is to assume that migration rates are too high to be estimated, and use an alternative model: two birth-death models with unknown initial population sizes in the two organs: $i_L = n_L(0), i_S = n_S(0)$.
+
+Note: because of the different orders of magnitude, the most efficient method is to estimate the log of all 6 parameters.
+
+- **Parameter estimates**:
+
+```{r, echo=F, comment=NULL}
+round(c(10^M004.wt.live.6.KL.optim.ikr.BLS.sum.3$par,D.sum=M004.wt.live.6.KL.optim.ikr.BLS.sum.3$value),3)
+```
+
+- **Bootstrapped estimates.** I repeated the minimisation of the sum of the KL-divergences 64 times, assuming a Poisson-distributed inoculum, each time re-sampling the data at 0.5h and 6h.
+
+```{r, echo=FALSE, fig.height=5}
+par(mar=c(3,4,1,0), las=1)
+boxplot(M004.wt.live.6.KL.optim.bs.ikr.BLS.sum[,1:7],log="y")
+```
+
+
+```{r, echo=FALSE, fig.height=6, fig.width=6}
+ggpairs(M004.wt.live.6.KL.optim.bs.ikr.BLS.sum,columns=1:6)
+```
+

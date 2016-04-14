@@ -1,0 +1,144 @@
+---
+title: "WITS Moments Hellinger Distance tests"
+author: "Olivier Restif"
+date: "Created 16 February 2016"
+output: 
+  html_document: 
+    fig_caption: yes
+    number_sections: yes
+    theme: readable
+---
+
+# Appendix to main report
+
+## Tests for inference using Hellinger distance from observed to predicted
+
+
+```{r init, echo=FALSE, message=FALSE}
+library(foreach)
+library(doParallel)
+registerDoParallel(cores=16)
+library(ggplot2)
+library(dplyr)
+library(tidyr)
+library(Rcpp)
+library(ellipse)
+library(powell)
+
+source("~/Documents/Work/server/Salmonella/ChrisWITS/Moments/WITS_moments.R")
+
+```
+
+### Test 1: Immigration-Birth-Death (IBD) process
+
+``` {r, echo=FALSE}
+load("~/Documents/Work/server/Salmonella/ChrisWITS/Moments/Hell_tests_2.RData")
+```
+
+**Stochastic noise.** From a given parameter set ($c_L$ = `r ibd.par.ref["cL"]`, $r_L$ = `r ibd.par.ref["rL"]`, $k_L$ = `r ibd.par.ref["kL"]`) and initial conditions (Poisson-distributed inoculum), I generated 10,000 Gillespie simulations, and calculated the "observed moments", either from all of them or from random subsets. I compared them to the "predicted moments" computed directly from the parameter values. The figures below show the distribution of Hellinger distances from the predicted moments to random subsets of simulations, varying either the number of simulations from which the observed moments were computed at t=12h  (left panel), or the observation time (right panel). Each boxplot represents 1000 subsets of simulations compared to a single predicted distribution, all generated using the same parameters.
+
+```{r, echo=F, fig.width=10, fig.height=5}
+par(mfrow=c(1,2),cex.main=1)
+
+boxplot(ibd.Hell.sim.dist,log="y",xlab="Number of simulations (WITS)",ylab="Hellinger distance",main="Distribution of Hellinger to subsets of simulations")
+
+boxplot(ibd.Hell.sim.t.obs,log="y",xlab="Observation time",ylab="Hellinger distance to sample of 80 simulations", main="Distribution of Hellinger for different observation times")
+
+```
+
+**Parameter sensitivity.** For the purpose of parameter inference, it is important to copare the sensitivity of the Hellinger distance to the parameters of the model. Here, I calculated the Hellinger distance from a range of predicted moments (obtained by varying each parameter in turn) to subsets of simulations obtained from the original set of parameter values. As before, each boxplot illustrates the stochastic variation in Hellinger across subsets of 80 simulations. In the fourth plot (bottom-right), I varied $k_L$ and $r_L$ simultaneously, keeping the difference $r_L-k_L$ constant. The vertical red lines show the parameter values that were used to generate the simulations.
+
+```{r, echo=F, fig.width=12, fig.height=5}
+par(mfrow=c(1,4),cex.lab=1.5,mar=c(4,4,1,1), oma=c(2,0,0,0))
+boxplot(ibd.Hell.sim.cL,log="y",xlab="Value of cL for prediction",ylab="Hellinger distance to sample of 80 simulations")
+abline(v=ibd.par.ref["cL"]*10,col="red",lwd=2,lty=2)
+
+boxplot(ibd.Hell.sim.kL,log="y",xlab="Value of kL for prediction",ylab="Hellinger distance to sample of 80 simulations")
+abline(v=ibd.par.ref["kL"]*10,col="red",lwd=2,lty=2)
+
+boxplot(ibd.Hell.sim.rL,log="y",xlab="Value of rL for prediction",ylab="Hellinger distance to sample of 80 simulations")
+abline(v=ibd.par.ref["rL"]*10,col="red",lwd=2,lty=2)
+
+boxplot(ibd.Hell.sim.kL.2,log="y",xlab="Value of kL for prediction",ylab="Hellinger distance to sample of 80 simulations")
+abline(v=ibd.par.ref["kL"]*10-2,col="red",lwd=2,lty=2)
+
+```
+
+**Parameter inference**: using a single set of simulations to calculate the observed moments, I used the `powell()` optimisation routine to estimate the set of parameter values that generated the predicted moments with lowest distance. With the same set of parameters as above, and assuming the inoculum distribution is known, the optimisation routine on 3 parameters is extremely fast and quite accurate. To get a sense of the parameter uncertainty associated with stochastic data, I repeated the optimisation on 1000 subsets of 80 simulations based on the same parameter values. As shown on the right panel, estimates of $k_L$ and $r_L$ were highly correlated, with a very accurate estimation of the net growth rate. The blue ellipse is the 95% bivariate confidence area based on the variance-covariance matrix of the paired estimates. The red crosses show the target parameter values.
+
+```{r, echo=F, fig.width=8, fig.height=4}
+par(mfrow=c(1,2),cex.lab=1.5,mar=c(4,4,1,1))
+
+boxplot(ibd.Hell.optim.bs)
+points(1:3, ibd.par.ref[c("cL","kL","rL")], col="red", pch="+", cex=3)
+
+plot(ibd.Hell.optim.bs[,'kL'],ibd.Hell.optim.bs[,'rL'],pch=".", xlab="kL", ylab="rL")
+lines(ellipse(cor(ibd.Hell.optim.bs[,"kL"],ibd.Hell.optim.bs[,"rL"]),centre=c(mean(ibd.Hell.optim.bs[,"kL"]),mean(ibd.Hell.optim.bs[,"rL"])),scale=c(sd(ibd.Hell.optim.bs[,"kL"]),sd(ibd.Hell.optim.bs[,"rL"]))),col="blue",lwd=2)
+points(ibd.par.ref["kL"],ibd.par.ref["rL"], col="red", pch="+", cex=3)
+```
+
+I repeated the optimisation across 27 sets of parameter values, assuming the same Poisson-distributed inoculum and a single observation, either at t=2h or t=12h, with a total of 80 WITS. Each boxplot shows the distribution of parameter estimates across 128 subsets of 80 simulations:
+
+```{r, echo=F,fig.width=12,fig.height=6}
+par(mfrow=c(3,9),mar=c(2,2,1,0.5),oma=c(1,0,4,0))
+for(i in 1:nrow(ibd.par.grid.Hell)){
+	boxplot(ibd.Hell.estimates.grid.1[[i]],ylim=c(0,1))
+	points(1:3,ibd.par.grid.Hell[i,],col="red",pch="+",cex=3)
+}
+title(main="Inference from observations at t=2h",outer=T)
+for(i in 1:nrow(ibd.par.grid.Hell)){
+	boxplot(ibd.Hell.estimates.grid.2[[i]],ylim=c(0,1))
+	points(1:3,ibd.par.grid.Hell[i,],col="red",pch="+",cex=3)
+}
+title(main="Inference from observations at t=12h",outer=T)
+```
+
+### Test 2: Bottleneck-Expansion-Spillover (BES) model
+
+This is the full 3-compartment model with 8 parameters. There are three stages, inline with Grant et al (2008) and Coward et al (2015):
+
+- **Bottleneck**: At t=0, an inoculum is introduced in the blood and allowed to migrate into the liver and spleen at rates $c_L$ and $c_S$ respectively, where the bacteria can replicate (rates $r_L$ and $r_S$) and die (rates $k_L$ and $k_S$). Initially (first 6 h), the net growth rates $r_L-k_L$ and $r_S-k_S$ are negative (hence the bottleneck).
+- **Expansion**: From t=6h, the replication and killing rates change in both organs, producing positive net growth rates.
+- **Spillover**: From t=24h, the emigration rates from the liver ($e_L$) and from the spleen ($e_S$) into the blood become positive, allowing mixing between the three compartments.
+
+```{r, echo=F,comment=NULL}
+load("~/Documents/Work/server/Salmonella/ChrisWITS/Moments/Hell_tests_BES_2.RData")
+
+rbind(Bottleneck=bes.par.B,Expansion=bes.par.E,Spillover=bes.par.S)
+
+```
+
+In line with the original experimental design with WITS, we assume that the inoculum doses are even mixtures of multiple identical WITS, and we model each WITS independently, irrespective of whether they are in the same mouse or not. For the purpose of parameter inference, we produce a large dataset by running 1000 Gillespie simulations and store the number of bacteria in the blood, liver and spleen at each observtion time: 0.5h, 6h, 24h and 48h post-inoculation. The inoculum is drawn from a Poisson distribution with mean `r bes.M0[1]`.
+
+Note: the low inoculum size produces a large probability of extinction in the Bottleneck phase, which is presumably not optimal for the moments method. 
+
+Moments computed from the simulations and by integration:
+
+```{r, echo=F, comment=NULL}
+# Compare with simulated moments
+round(cbind(sim.05=bes.sim.mom.0,int.05=bes.mom.0,sim.6=bes.sim.mom.B,int.6=bes.mom.B,sim.24=bes.sim.mom.E,int.24=bes.mom.E,sim.48=bes.sim.mom.S,int.48=bes.mom.S),1)
+
+```
+
+
+#### Inter-sample variability
+
+The following plots show the distributions of parameter estimates obtained in each phase from 36 datasets of 100 WITS each. In other words, each boxplot represents 36 estimates, each obtained by minimising the Hell-distance for the moments calculated from 100 simulations.The red crosses show the true parameter values.
+
+- Bottleneck: known inoculum, no emigration, minimise the sum of the two Hellinger distances.
+- Expansion: initial moments at t=6h from the data, liver-spleen only, no emigration.
+- Spillover: initial moments at t=24h from the data, all organs.
+
+```{r, echo=F, fig.width=12, fig.height=5}
+par(mfrow=c(1,3))
+# Bottleneck
+boxplot(bes.Hell.optim.B.bs,ylim=c(0,1.5), main="Bottleneck parameters")
+points(1:6,bes.par.B[names(bes.Hell.optim.ckr.B$par)],pch="+",col="red",cex=2)
+# Expansion
+boxplot(bes.Hell.optim.E.bs,ylim=c(0,1.5), main="Expansion parameters")
+points(1:4,bes.par.E[names(bes.par.kr)],pch="+",col="red",cex=2)
+# Spillover
+boxplot(bes.Hell.optim.S.bs, ylim=c(0,1.5), main="Spillover parameters")
+points(1:8,bes.par.S[names(bes.par.def)],pch="+",col="red",cex=2)
+
+```
